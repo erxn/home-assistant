@@ -29,7 +29,7 @@ async def test_loading_old_data_format(hass, hass_storage):
                     "access_token_expiration": 1800.0,
                     "client_id": "http://localhost:8123/",
                     "created_at": "2018-10-03T13:43:19.774637+00:00",
-                    "id": "a95025b7b555486587ad8336f5653e20",
+                    "id": "user-token-id",
                     "jwt_key": "some-key",
                     "last_used_at": "2018-10-03T13:43:19.774712+00:00",
                     "token": "some-token",
@@ -39,11 +39,20 @@ async def test_loading_old_data_format(hass, hass_storage):
                     "access_token_expiration": 1800.0,
                     "client_id": None,
                     "created_at": "2018-10-03T13:43:19.774637+00:00",
-                    "id": "a95025b7b555486587ad8336f5653e20",
+                    "id": "system-token-id",
                     "jwt_key": "some-key",
                     "last_used_at": "2018-10-03T13:43:19.774712+00:00",
                     "token": "some-token",
                     "user_id": "system-id"
+                },
+                {
+                    "access_token_expiration": 1800.0,
+                    "client_id": "http://localhost:8123/",
+                    "created_at": "2018-10-03T13:43:19.774637+00:00",
+                    "id": "hidden-because-no-jwt-id",
+                    "last_used_at": "2018-10-03T13:43:19.774712+00:00",
+                    "token": "some-token",
+                    "user_id": "user-id"
                 },
             ]
         }
@@ -52,6 +61,22 @@ async def test_loading_old_data_format(hass, hass_storage):
     store = auth_store.AuthStore(hass)
     groups = await store.async_get_groups()
     assert len(groups) == 1
+    group = groups[0]
+    assert group.name == "All Access"
+
     users = await store.async_get_users()
     assert len(users) == 2
-    assert False, 'test all attributes'
+
+    owner, system = users
+
+    assert owner.system_generated is False
+    assert owner.groups == [group]
+    assert len(owner.refresh_tokens) == 1
+    owner_token = list(owner.refresh_tokens.values())[0]
+    assert owner_token.id == 'user-token-id'
+
+    assert system.system_generated is True
+    assert system.groups == []
+    assert len(system.refresh_tokens) == 1
+    system_token = list(system.refresh_tokens.values())[0]
+    assert system_token.id == 'system-token-id'
