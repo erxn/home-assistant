@@ -45,7 +45,7 @@ async def test_list(hass, hass_ws_client):
         id='abc',
         name='Test Owner',
         is_owner=True,
-        groups=[group.id],
+        groups=[group],
     ).add_to_hass(hass)
 
     owner.credentials.append(auth_models.Credentials(
@@ -64,7 +64,7 @@ async def test_list(hass, hass_ws_client):
         id='hij',
         name='Inactive User',
         is_active=False,
-        groups=[group.id],
+        groups=[group],
     ).add_to_hass(hass)
 
     refresh_token = await hass.auth.async_create_refresh_token(

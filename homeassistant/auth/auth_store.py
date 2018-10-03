@@ -4,71 +4,16 @@ from datetime import timedelta
 import hmac
 from logging import getLogger
 from typing import Any, Dict, List, Optional  # noqa: F401
-import uuid
 
 from homeassistant.auth.const import ACCESS_TOKEN_EXPIRATION
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import storage
 from homeassistant.util import dt as dt_util
 
 from . import models
 
-STORAGE_VERSION = 2
+STORAGE_VERSION = 1
 STORAGE_KEY = 'auth'
-
-
-class DataStore(storage.Store):
-    """Store the auth data on disk using JSON."""
-
-    def __init__(self, hass: HomeAssistant) -> None:
-        """Initialize the data store."""
-        super().__init__(hass, STORAGE_VERSION, STORAGE_KEY, True)
-
-    async def _async_migrate_func(self, old_version: int,
-                                  old_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Migrate to the new version."""
-        if old_version <= 1:
-            all_access_group_id = uuid.uuid4().hex
-
-            old_data['groups'] = [
-                {
-                    'name': 'All Access',
-                    'id': all_access_group_id,
-                },
-            ]
-
-            for user_dict in old_data['users']:
-                if user_dict['system_generated']:
-                    groups = []
-                else:
-                    groups = [all_access_group_id]
-
-                user_dict['group_ids'] = groups
-
-            refresh_tokens = []
-
-            for rt_dict in old_data['refresh_tokens']:
-                if 'jwt_key' not in rt_dict:
-                    continue
-
-                if 'token_type' not in rt_dict:
-                    if rt_dict['client_id'] is None:
-                        token_type = models.TOKEN_TYPE_SYSTEM
-                    else:
-                        token_type = models.TOKEN_TYPE_NORMAL
-
-                    rt_dict['token_type'] = token_type
-
-                rt_dict.setdefault('last_used_at', None)
-                rt_dict.setdefault('client_name', None)
-                rt_dict.setdefault('client_icon', None)
-                rt_dict.setdefault('last_used_ip', None)
-
-                refresh_tokens.append(rt_dict)
-
-            old_data['refresh_tokens'] = refresh_tokens
-
-        return old_data
+INITIAL_GROUP_NAME = 'All Access'
 
 
 class AuthStore:
@@ -85,7 +30,16 @@ class AuthStore:
         self.hass = hass
         self._users = None  # type: Optional[Dict[str, models.User]]
         self._groups = None  # type: Optional[Dict[str, models.Group]]
-        self._store = DataStore(hass)
+        self._store = hass.helpers.storage.Store(STORAGE_VERSION, STORAGE_KEY,
+                                                 private=True)
+
+    async def async_get_groups(self) -> List[models.Group]:
+        """Retrieve all users."""
+        if self._groups is None:
+            await self._async_load()
+            assert self._groups is not None
+
+        return list(self._groups.values())
 
     async def async_get_users(self) -> List[models.User]:
         """Retrieve all users."""
@@ -107,7 +61,8 @@ class AuthStore:
             self, name: Optional[str], is_owner: Optional[bool] = None,
             is_active: Optional[bool] = None,
             system_generated: Optional[bool] = None,
-            credentials: Optional[models.Credentials] = None) -> models.User:
+            credentials: Optional[models.Credentials] = None,
+            groups: Optional[List[models.Group]] = None) -> models.User:
         """Create a new user."""
         if self._users is None:
             await self._async_load()
@@ -115,16 +70,11 @@ class AuthStore:
         assert self._users is not None
         assert self._groups is not None
 
-        if system_generated:
-            groups = []
-        else:
-            groups = [list(self._groups.values())[0]]
-
         kwargs = {
             'name': name,
             # Until we get group management, we just put everyone in the
             # same group.
-            'groups': groups
+            'groups': groups or [],
         }  # type: Dict[str, Any]
 
         if is_owner is not None:
@@ -291,21 +241,30 @@ class AuthStore:
         # prevents crashing if user rolls back HA version after a new property
         # was added.
 
-        for group_dict in data['groups']:
+        for group_dict in data.get('groups', []):
             groups[group_dict['id']] = models.Group(
                 name=group_dict['name'],
                 id=group_dict['id'],
             )
 
+        migrate_group = None
+
+        if not groups:
+            migrate_group = models.Group(name=INITIAL_GROUP_NAME)
+            groups[migrate_group.id] = migrate_group
+
         for user_dict in data['users']:
             users[user_dict['id']] = models.User(
                 name=user_dict['name'],
                 groups=[groups[group_id] for group_id
-                        in user_dict['group_ids']],
+                        in user_dict.get('group_ids', [])],
                 id=user_dict['id'],
                 is_owner=user_dict['is_owner'],
                 is_active=user_dict['is_active'],
+                system_generated=user_dict['system_generated'],
             )
+            if migrate_group is not None and not user_dict['system_generated']:
+                users[user_dict['id']].groups = [migrate_group]
 
         for cred_dict in data['credentials']:
             users[cred_dict['user_id']].credentials.append(models.Credentials(
@@ -317,6 +276,10 @@ class AuthStore:
             ))
 
         for rt_dict in data['refresh_tokens']:
+            # Filter out the old keys that don't have jwt_key (pre-0.76)
+            if 'jwt_key' not in rt_dict:
+                continue
+
             created_at = dt_util.parse_datetime(rt_dict['created_at'])
             if created_at is None:
                 getLogger(__name__).error(
@@ -324,7 +287,15 @@ class AuthStore:
                     '%(created_at)s for user_id %(user_id)s', rt_dict)
                 continue
 
-            last_used_at_str = rt_dict['last_used_at']
+            token_type = rt_dict.get('token_type')
+            if token_type is None:
+                if rt_dict['client_id'] is None:
+                    token_type = models.TOKEN_TYPE_SYSTEM
+                else:
+                    token_type = models.TOKEN_TYPE_NORMAL
+
+            # old refresh_token don't have last_used_at (pre-0.78)
+            last_used_at_str = rt_dict.get('last_used_at')
             if last_used_at_str:
                 last_used_at = dt_util.parse_datetime(last_used_at_str)
             else:
@@ -334,16 +305,17 @@ class AuthStore:
                 id=rt_dict['id'],
                 user=users[rt_dict['user_id']],
                 client_id=rt_dict['client_id'],
-                client_name=rt_dict['client_name'],
-                client_icon=rt_dict['client_icon'],
-                token_type=rt_dict['token_type'],
+                # use dict.get to keep backward compatibility
+                client_name=rt_dict.get('client_name'),
+                client_icon=rt_dict.get('client_icon'),
+                token_type=token_type,
                 created_at=created_at,
                 access_token_expiration=timedelta(
                     seconds=rt_dict['access_token_expiration']),
                 token=rt_dict['token'],
                 jwt_key=rt_dict['jwt_key'],
                 last_used_at=last_used_at,
-                last_used_ip=rt_dict['last_used_ip'],
+                last_used_ip=rt_dict.get('last_used_ip'),
             )
             users[rt_dict['user_id']].refresh_tokens[token.id] = token
 
@@ -371,6 +343,7 @@ class AuthStore:
                 'is_owner': user.is_owner,
                 'is_active': user.is_active,
                 'name': user.name,
+                'system_generated': user.system_generated,
             }
             for user in self._users.values()
         ]
@@ -429,7 +402,7 @@ class AuthStore:
         self._users = OrderedDict()  # type: Dict[str, models.User]
 
         # Add default group
-        all_access_group = models.Group(name='All Access')
+        all_access_group = models.Group(name=INITIAL_GROUP_NAME)
 
         groups = OrderedDict()  # type: Dict[str, models.Group]
         groups[all_access_group.id] = all_access_group
